@@ -1,0 +1,128 @@
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "21a20cd2",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Setup: imports and constants\n",
+    "import os, glob, zipfile\n",
+    "import numpy as np\n",
+    "import pandas as pd\n",
+    "from sklearn.preprocessing import StandardScaler\n",
+    "from sklearn.ensemble import IsolationForest\n",
+    "DATA_DIR = \"/workspace/data\"\n",
+    "OUTPUT_SUBMISSION = \"/workspace/submission.csv\"\n",
+    "OUTPUT_ZIP = \"/workspace/result.zip\"\n",
+    "RANDOM_STATE = 42\n",
+    "np.random.seed(RANDOM_STATE)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "51a8262b",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Load and align\n",
+    "from typing import Dict, Tuple\n",
+    "def infer_columns(df: pd.DataFrame):\n",
+    "    lower_cols = {c.lower(): c for c in df.columns}\n",
+    "    ts_col = None\n",
+    "    for key in lower_cols:\n",
+    "        if \"time\" in key or key in {\"timestamp\", \"datetime\"}:\n",
+    "            ts_col = lower_cols[key]; break\n",
+    "    if ts_col is None: ts_col = df.columns[0]\n",
+    "    numeric_cols = [c for c in df.columns if c != ts_col and pd.api.types.is_numeric_dtype(df[c])]\n",
+    "    val_col = numeric_cols[0] if numeric_cols else [c for c in df.columns if c != ts_col][0]\n",
+    "    return ts_col, val_col\n",
+    "def read_sensor_csv(path: str):\n",
+    "    name = os.path.basename(path).replace(\"_test.csv\", \"\")\n",
+    "    df = pd.read_csv(path)\n",
+    "    ts_col, val_col = infer_columns(df)\n",
+    "    df[ts_col] = pd.to_datetime(df[ts_col], errors=\"coerce\")\n",
+    "    df = df.dropna(subset=[ts_col]).sort_values(ts_col).reset_index(drop=True)\n",
+    "    df = df[[ts_col, val_col]].rename(columns={ts_col: \"timestamp\", val_col: name})\n",
+    "    return name, df\n",
+    "csv_files = sorted(glob.glob(os.path.join(DATA_DIR, \"*_test.csv\")))\n",
+    "sensor_to_df, sensor_lengths = {}, {}\n",
+    "for f in csv_files:\n",
+    "    s, sdf = read_sensor_csv(f); sensor_to_df[s]=sdf; sensor_lengths[s]=len(sdf)\n",
+    "highest_sensor = max(sensor_lengths.items(), key=lambda kv: kv[1])[0]\n",
+    "base_timeline = sensor_to_df[highest_sensor][[\"timestamp\"]].dropna().drop_duplicates().sort_values(\"timestamp\").reset_index(drop=True)\n",
+    "aligned = base_timeline.copy()\n",
+    "for s, sdf in sensor_to_df.items():\n",
+    "    sdf = sdf.sort_values(\"timestamp\").reset_index(drop=True)\n",
+    "    merged = pd.merge_asof(base_timeline.sort_values(\"timestamp\"), sdf, on=\"timestamp\", direction=\"nearest\", tolerance=pd.Timedelta(\"5min\"))\n",
+    "    aligned[s] = merged[s]\n",
+    "aligned = aligned.sort_values(\"timestamp\").reset_index(drop=True)\n",
+    "value_cols = [c for c in aligned.columns if c != \"timestamp\"]\n",
+    "aligned[value_cols] = aligned[value_cols].ffill().bfill()\n",
+    "print(f\"Loaded {len(csv_files)} sensors. Highest-rate sensor: {highest_sensor}. Timeline length: {len(aligned)}\")"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "dbb16867",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Feature engineering\n",
+    "ROLL_WINDOWS = [5, 15, 60]; NUM_LAGS = 3\n",
+    "fe = aligned.copy()\n",
+    "for col in value_cols:\n",
+    "    for w in ROLL_WINDOWS:\n",
+    "        r = fe[col].rolling(window=w, min_periods=max(2, w//3))\n",
+    "        fe[f\"{col}_rollmean_{w}\"] = r.mean(); fe[f\"{col}_rollstd_{w}\"] = r.std()\n",
+    "        fe[f\"{col}_rollmin_{w}\"] = r.min(); fe[f\"{col}_rollmax_{w}\"] = r.max()\n",
+    "for col in value_cols:\n",
+    "    for lag in range(1, NUM_LAGS+1):\n",
+    "        fe[f\"{col}_lag_{lag}\"] = fe[col].shift(lag)\n",
+    "feature_cols = [c for c in fe.columns if c != \"timestamp\"]\n",
+    "fe[feature_cols] = fe[feature_cols].bfill().ffill()\n",
+    "scaler = StandardScaler(); X = scaler.fit_transform(fe[feature_cols])\n",
+    "print(X.shape)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "88965f11",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Train and predict\n",
+    "iso = IsolationForest(n_estimators=300, contamination=0.01, random_state=RANDOM_STATE, n_jobs=-1)\n",
+    "iso.fit(X)\n",
+    "scores = iso.score_samples(X)\n",
+    "labels = (iso.predict(X)==-1).astype(int)\n",
+    "pred_df = pd.DataFrame({\"timestamp\": fe[\"timestamp\"].values, \"anomaly_score\": scores, \"prediction\": labels})\n",
+    "pred_df.head()"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "id": "3f629baf",
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Save submission and zip\n",
+    "submission = pd.DataFrame({\"prediction\": pred_df[\"prediction\"].astype(int).values})\n",
+    "assert len(submission) == len(aligned)\n",
+    "submission.to_csv(OUTPUT_SUBMISSION, index=False)\n",
+    "with zipfile.ZipFile(OUTPUT_ZIP, 'w', compression=zipfile.ZIP_DEFLATED) as zf:\n",
+    "    zf.write(OUTPUT_SUBMISSION, arcname=os.path.basename(OUTPUT_SUBMISSION))\n",
+    "    zf.write(\"/workspace/notebook.ipynb\", arcname=\"notebook.ipynb\")\n",
+    "print(f\"Wrote {OUTPUT_SUBMISSION} and {OUTPUT_ZIP}\")"
+   ]
+  }
+ ],
+ "metadata": {},
+ "nbformat": 4,
+ "nbformat_minor": 5
+}
